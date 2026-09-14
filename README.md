@@ -12,12 +12,10 @@ mise exec -- wget --version
 
 ## Demo: ffmpeg without Homebrew
 
-![truebrew installing ffmpeg](demo/truebrew-ffmpeg.gif)
+[![asciicast](https://asciinema.org/a/1265408.svg)](https://asciinema.org/a/1265408)
 
 A 15-formula closure (parallel bottle downloads, per-keg relocation, then a
-working `ffmpeg` doing a libx264 transcode) — recorded with
-[asciinema](https://asciinema.org): [watch online](https://asciinema.org/a/1265408)
-· [raw cast](demo/truebrew-ffmpeg.cast) · scripted by [demo/demo.sh](demo/demo.sh).
+working `ffmpeg` doing a libx264 transcode).
 
 ## How it works
 
