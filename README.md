@@ -5,10 +5,19 @@ without Homebrew** — no `brew` binary, no `/opt/homebrew`, no sudo.
 Inspired by [zerobrew](https://github.com/lucasgelfond/zerobrew).
 
 ```bash
-mise plugin install truebrew https://github.com/mise-plugins/mise-truebrew
+mise plugin install truebrew https://github.com/matixlol/mise-truebrew
 mise use truebrew:wget@1.25.0
 mise exec -- wget --version
 ```
+
+## Demo: ffmpeg without Homebrew
+
+![truebrew installing ffmpeg](demo/truebrew-ffmpeg.gif)
+
+A 15-formula closure (parallel bottle downloads, per-keg relocation, then a
+working `ffmpeg` doing a libx264 transcode) — recorded with
+[asciinema](https://asciinema.org): [watch online](https://asciinema.org/a/1265408)
+· [raw cast](demo/truebrew-ffmpeg.cast) · scripted by [demo/demo.sh](demo/demo.sh).
 
 ## How it works
 
