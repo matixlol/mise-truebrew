@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# mise-tasks/test — end-to-end smoke test for the truebrew backend plugin.
+# Usage: ./mise-tasks/test  (or: mise run test)
+set -euo pipefail
+
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+echo "== truebrew e2e =="
+echo "plugin: $PLUGIN_DIR"
+
+mise plugin link --force truebrew "$PLUGIN_DIR"
+
+echo "-- ls-remote truebrew:jq --"
+mise ls-remote truebrew:jq
+
+echo "-- install truebrew:jq --"
+mise install truebrew:jq@latest
+
+echo "-- exec jq --version --"
+mise exec truebrew:jq@latest -- jq --version
+echo '{"hello":"world"}' | mise exec truebrew:jq@latest -- jq .hello
+
+echo "-- install truebrew:ripgrep (dep: pcre2) --"
+mise install truebrew:ripgrep@latest
+mise exec truebrew:ripgrep@latest -- rg --version
+
+echo "OK"

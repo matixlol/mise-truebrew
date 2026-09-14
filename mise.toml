@@ -1,0 +1,10 @@
+[tools]
+lua = "5.1"
+"aqua:JohnnyMorganz/StyLua" = "latest"
+
+[settings]
+always_keep_download = false
+
+[tasks.test]
+description = "End-to-end smoke test: link plugin, install jq + deps, run it"
+run = "./mise-tasks/test"
