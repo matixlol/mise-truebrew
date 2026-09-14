@@ -22,15 +22,18 @@ For `truebrew:<formula>@<version>`, the plugin:
    (`arm64_tahoe` → `arm64_sequoia` → … on Apple Silicon, `sonoma`/`ventura`/…
    on Intel Macs, `arm64_linux`/`x86_64_linux` on Linux, with an `all` fallback).
    Newer-OS bottles are never selected on older systems.
-4. Downloads the bottle blob from GHCR (anonymous token auth) and **verifies
+4. Downloads the bottle blobs from GHCR (anonymous token auth) **in parallel**
+   (up to 8 concurrent `curl` fetches, `TRUEBREW_JOBS` to tune) and **verifies
    the sha256** from the API before touching disk. Downloads are cached by hash.
 5. Extracts into a user-owned shared prefix and **relocates** it the way
-   `brew pour` does:
+   `brew pour` does, in a single `lib/relocate.sh` invocation per keg (one
+   subprocess no matter how many files the keg has):
    - Mach-O load commands holding `@@HOMEBREW_PREFIX@@` / `@@HOMEBREW_CELLAR@@`
      are rewritten with `install_name_tool` (text patching binaries is never done),
-   - text files (pkgconfig, scripts, cmake, headers) get placeholder + hardcoded
-     build-prefix replacement (this pass always runs, even for
-     `:any_skip_relocation`-style bottles),
+   - text files (pkgconfig, scripts, cmake, headers) get placeholder +
+     hardcoded build-prefix replacement in one `perl` pass (this pass always
+     runs, even for `:any_skip_relocation`-style bottles; static archives and
+     other binaries are never text-patched),
    - absolute symlinks into the old prefix are re-pointed,
    - touched Mach-O files are re-signed with `codesign -f -s -`.
 6. Links `opt/<name>` → `Cellar/<name>/<version>` and shims the keg's
@@ -87,6 +90,7 @@ tool name and version are separate fields:
 | Setting | Effect |
 | --- | --- |
 | `TRUEBREW_ROOT` env (or `root = "…"` tool option) | Override the shared root (prefix + caches). |
+| `TRUEBREW_JOBS` env (or `MISE_JOBS`) | Max parallel bottle/metadata downloads (default 8, cap 16). |
 
 `BackendExecEnv` puts the tool's `bin` first on `PATH` and additionally
 provides `LDFLAGS` / `CPPFLAGS` / `PKG_CONFIG_PATH` / `MANPATH` pointing at the

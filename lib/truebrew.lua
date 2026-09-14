@@ -322,6 +322,32 @@ function M.macos_major()
     return tonumber(major)
 end
 
+-- Memoize platform detection: one hook invocation == one platform, so the
+-- sw_vers/uname subprocesses run once instead of once per formula.
+do
+    local _os_fn, _arch_fn, _mac_fn = M.current_os, M.current_arch, M.macos_major
+    local _os, _arch, _macmajor, _mac_set = nil, nil, nil, false
+    function M.current_os()
+        if _os == nil then
+            _os = _os_fn()
+        end
+        return _os
+    end
+    function M.current_arch()
+        if _arch == nil then
+            _arch = _arch_fn()
+        end
+        return _arch
+    end
+    function M.macos_major()
+        if not _mac_set then
+            _macmajor = _mac_fn()
+            _mac_set = true
+        end
+        return _macmajor
+    end
+end
+
 -- Ordered newest-first arm64 macOS bottle tags known to Homebrew.
 M.ARM64_MAC_TAGS = {
     { tag = "arm64_golden_gate", major = 27 },
@@ -509,12 +535,6 @@ function M.opt_link(paths, name)
     return M.join(paths.opt, name)
 end
 
-function M.is_regular_file(path)
-    -- Regular file, not a symlink/dir (portable across mise file-module versions).
-    local ok, _ = pcall(cmd.exec, "test -f " .. M.shquote(path) .. " && test ! -L " .. M.shquote(path))
-    return ok
-end
-
 function M.is_file_like(path)
     -- True for regular files and symlinks-to-files; false for dirs/missing.
     local ok, _ = pcall(cmd.exec, "test -f " .. M.shquote(path))
@@ -538,201 +558,45 @@ function M.dir_entries(dir)
     return t
 end
 
-function M.list_files_with_string(dir, needle)
-    -- Returns newline-separated paths containing needle (may include binaries).
+-- Pour relocation lives in lib/relocate.sh (single shell invocation).
+
+-- Pour relocation runs as ONE shell invocation (lib/relocate.sh): per-call
+-- bridge overhead dominates here, so the whole scan/rewrite/sign pass pays
+-- it once no matter how many files a keg has.
+function M.relocate_keg(keg_dir, prefix, cellar)
+    if RUNTIME == nil or RUNTIME.pluginDirPath == nil then
+        error("truebrew: RUNTIME.pluginDirPath unavailable (need plugin dir for relocate.sh)")
+    end
+    local script = M.join(RUNTIME.pluginDirPath, "lib", "relocate.sh")
     local ok, out = pcall(
         cmd.exec,
-        "grep -rl " .. M.shquote(needle) .. " " .. M.shquote(dir) .. " 2>/dev/null || true"
+        "sh "
+            .. M.shquote(script)
+            .. " "
+            .. M.shquote(keg_dir)
+            .. " "
+            .. M.shquote(prefix)
+            .. " "
+            .. M.shquote(cellar)
     )
-    if not ok or not out or M.trim(out) == "" then
-        return {}
-    end
-    local t = {}
-    for raw in tostring(out):gmatch("[^\n]+") do
-        local line = M.trim(raw)
-        if line ~= "" then
-            table.insert(t, line)
-        end
-    end
-    return t
-end
-
-function M.is_macho(path)
-    local ok, out = pcall(cmd.exec, "file " .. M.shquote(path))
-    return ok and out and tostring(out):find("Mach%-O") ~= nil
-end
-
-function M.is_elf(path)
-    local ok, out = pcall(cmd.exec, "file " .. M.shquote(path))
-    return ok and out and tostring(out):find("ELF") ~= nil
-end
-
-function M.macho_refs(path)
-    local ok, out = pcall(cmd.exec, "otool -L " .. M.shquote(path) .. " 2>/dev/null")
-    if not ok or not out then
-        return {}
-    end
-    local refs = {}
-    for raw in tostring(out):gmatch("[^\n]+") do
-        local lib = M.trim(raw):match("^(%S+) %(")
-        if lib and lib:find("@@HOMEBREW") then
-            table.insert(refs, lib)
-        end
-    end
-    return refs
-end
-
-function M.macho_id(path)
-    local ok, out = pcall(cmd.exec, "otool -D " .. M.shquote(path) .. " 2>/dev/null")
-    if not ok or not out then
-        return nil
-    end
-    local lines = {}
-    for raw in tostring(out):gmatch("[^\n]+") do
-        table.insert(lines, M.trim(raw))
-    end
-    if #lines >= 2 and lines[2]:find("@@HOMEBREW") then
-        return lines[2]
-    end
-    return nil
-end
-
-function M.relocate_macho_file(path, prefix, cellar)
-    local changed = false
-    for _, old in ipairs(M.macho_refs(path)) do
-        local new = old:gsub("@@HOMEBREW_PREFIX@@", prefix):gsub("@@HOMEBREW_CELLAR@@", cellar)
-        if new ~= old then
-            local ok, err = pcall(
-                cmd.exec,
-                "install_name_tool -change "
-                    .. M.shquote(old)
-                    .. " "
-                    .. M.shquote(new)
-                    .. " "
-                    .. M.shquote(path)
-            )
-            if not ok then
-                error("truebrew: install_name_tool -change failed for " .. path .. ": " .. tostring(err))
-            end
-            changed = true
-        end
-    end
-    local id = M.macho_id(path)
-    if id then
-        local new_id = id:gsub("@@HOMEBREW_PREFIX@@", prefix):gsub("@@HOMEBREW_CELLAR@@", cellar)
-        if new_id ~= id then
-            local ok, err =
-                pcall(cmd.exec, "install_name_tool -id " .. M.shquote(new_id) .. " " .. M.shquote(path))
-            if not ok then
-                error("truebrew: install_name_tool -id failed for " .. path .. ": " .. tostring(err))
-            end
-            changed = true
-        end
-    end
-    return changed
-end
-
-function M.relocate_text_file(path, prefix, cellar)
-    -- Only call on non-Mach-O/non-ELF regular files.
-    local ok, err = pcall(cmd.exec, table.concat({
-        "perl -pi -e",
-        M.shquote("s|@@HOMEBREW_PREFIX@@|" .. prefix .. "|g; s|@@HOMEBREW_CELLAR@@|" .. cellar .. "|g"),
-        M.shquote(path),
-    }, " "))
     if not ok then
-        error("truebrew: placeholder replacement failed for " .. path .. ": " .. tostring(err))
+        error("truebrew: relocation failed for " .. keg_dir .. ": " .. tostring(out))
     end
-    -- Also rewrite hardcoded build prefixes in text (scripts, pc files, cmake).
-    -- Harmless when absent; restricted to text files so Mach-O is untouched.
-    pcall(cmd.exec, table.concat({
-        "perl -pi -e",
-        M.shquote(
-            "s|/opt/homebrew|"
-                .. prefix
-                .. "|g; s|/usr/local|"
-                .. prefix
-                .. "|g; s|/home/linuxbrew/.linuxbrew|"
-                .. prefix
-                .. "|g"
-        ),
-        M.shquote(path),
-    }, " "))
-end
-
-function M.relocate_keg(keg_dir, prefix, cellar)
-    local os_name = M.current_os()
-    -- 1. Mach-O / ELF linkage pass (never text-patch binaries).
-    local candidates = {}
-    for _, needle in ipairs({ "@@HOMEBREW_PREFIX@@", "@@HOMEBREW_CELLAR@@" }) do
-        for _, p in ipairs(M.list_files_with_string(keg_dir, needle)) do
-            candidates[p] = true
-        end
-    end
-    local macho_changed = {}
-    for path, _ in pairs(candidates) do
-        if M.is_regular_file(path) and M.is_macho(path) then
-            if os_name ~= "darwin" then
-                log.warn("truebrew: Mach-O file on non-macOS: " .. path)
-            else
-                local ok, res = pcall(M.relocate_macho_file, path, prefix, cellar)
-                if not ok then
-                    error(res)
-                end
-                if res then
-                    macho_changed[#macho_changed + 1] = path
-                end
-            end
-        end
-    end
-    -- 2. Text pass (scripts, pkgconfig, cmake, headers). Always runs,
-    --    even for :any_skip_relocation-style bottles.
-    local text_count = 0
-    for path, _ in pairs(candidates) do
-        if M.is_regular_file(path) and not M.is_macho(path) and not M.is_elf(path) then
-            M.relocate_text_file(path, prefix, cellar)
-            text_count = text_count + 1
-        elseif M.is_regular_file(path) and M.is_elf(path) and os_name == "linux" then
-            log.warn("truebrew: ELF file with placeholders needs patchelf review: " .. path)
-        end
-    end
-    -- 3. Hardcoded build-prefix in text files (non-relocatable bottles).
-    for _, needle in ipairs({ "/opt/homebrew/Cellar", "/home/linuxbrew/.linuxbrew/Cellar" }) do
-        for _, path in ipairs(M.list_files_with_string(keg_dir, needle)) do
-            if M.is_regular_file(path) and not M.is_macho(path) and not M.is_elf(path) then
-                M.relocate_text_file(path, prefix, cellar)
-                text_count = text_count + 1
-            end
-        end
-    end
-    -- 4. Relativize absolute symlinks pointing into the old Homebrew prefix.
-    pcall(cmd.exec, table.concat({
-        "find",
-        M.shquote(keg_dir),
-        "-type l -print0 | while IFS= read -r -d '' l; do",
-        't="$(readlink "$l")";',
-        'case "$t" in',
-        "/opt/homebrew/*|/usr/local/Cellar/*|/usr/local/opt/*|/home/linuxbrew/.linuxbrew/*)",
-        -- map old prefix -> new prefix, keep the remainder
-        'n="'
-            .. prefix
-            .. '${t#/opt/homebrew}";',
-        -- crude but safe: only rewrite when target exists under new prefix
-        'if [ -e "$n" ]; then ln -sfn "$n" "$l"; fi;;',
-        "esac; done",
-    }, " "))
-    -- 5. Re-sign everything we touched (arm64 macOS requires it).
-    if os_name == "darwin" and #macho_changed > 0 then
-        local parts = { "codesign -f -s -" }
-        for _, p in ipairs(macho_changed) do
-            table.insert(parts, M.shquote(p))
-        end
-        local ok, err = pcall(cmd.exec, table.concat(parts, " "))
-        if not ok then
-            error("truebrew: codesign failed: " .. tostring(err))
-        end
+    local macho, text, skipped = tostring(out or ""):match("TRUEBREW_RELOCATE macho=(%d+) text=(%d+) skipped=(%d+)")
+    local extra = ""
+    if (tonumber(skipped or "0") or 0) > 0 then
+        extra = ", " .. skipped .. " skipped"
     end
     log.info(
-        "truebrew: relocated " .. keg_dir .. " (" .. #macho_changed .. " Mach-O, " .. text_count .. " text)"
+        "truebrew: relocated "
+            .. keg_dir
+            .. " ("
+            .. tostring(macho or "?")
+            .. " Mach-O, "
+            .. tostring(text or "?")
+            .. " text"
+            .. extra
+            .. ")"
     )
 end
 
@@ -799,80 +663,369 @@ end
 
 -- Install one formula's bottle into the shared Cellar (deps must already be
 -- installed by the caller). Returns keg_dir.
-function M.install_keg(name, formula, paths)
-    local keg_ver = M.keg_version(formula)
-    local keg_dir = M.keg_dir(paths, name, keg_ver)
-    local tag, entry = M.select_bottle(formula)
-    local url = entry["url"]
-    local sha = tostring(entry["sha256"]):lower()
+-- ---------------------------------------------------------------------------
+-- parallel fetch (bottle downloads are latency-bound while a Lua hook is
+-- single-threaded, so fan out through POSIX background jobs + `wait`)
+-- ---------------------------------------------------------------------------
 
-    local receipt = M.read_keg_receipt(keg_dir)
-    if receipt and receipt["sha256"] == sha and file.exists(keg_dir) then
-        log.info("truebrew: already installed " .. name .. " " .. keg_ver)
-        M.refresh_opt_link(paths, name, keg_ver)
-        return keg_dir
-    end
-    if file.exists(keg_dir) and receipt == nil then
-        -- Foreign/partial dir: only reuse when it looks complete.
-        if not file.exists(M.join(keg_dir, "INSTALL_RECEIPT.json")) then
-            log.warn("truebrew: removing incomplete keg dir " .. keg_dir)
-            pcall(cmd.exec, "rm -rf " .. M.shquote(keg_dir))
-        end
-    end
+local _have_curl = nil
 
-    M.ensure_dirs(paths)
-    local blob = M.join(paths.cache_blobs, sha .. ".tar.gz")
-    M.download_bottle(url, sha, blob)
-
-    if not file.exists(keg_dir) then
-        log.info("truebrew: pouring " .. name .. " " .. keg_ver .. " (" .. tag .. ")")
-        local ok, err = pcall(cmd.exec, "tar -xzf " .. M.shquote(blob) .. " -C " .. M.shquote(paths.cellar))
-        if not ok then
-            error("truebrew: extraction failed for " .. name .. ": " .. tostring(err))
-        end
-        if not file.exists(keg_dir) then
-            error(
-                "truebrew: bottle for "
-                    .. name
-                    .. " did not contain expected keg "
-                    .. name
-                    .. "/"
-                    .. keg_ver
-            )
-        end
-        M.relocate_keg(keg_dir, paths.prefix, paths.cellar)
-        M.write_keg_receipt(keg_dir, {
-            name = name,
-            keg_version = keg_ver,
-            stable = M.stable_version(formula),
-            bottle_tag = tag,
-            bottle_url = url,
-            sha256 = sha,
-            prefix = paths.prefix,
-            cellar = paths.cellar,
-            ruby_source_path = formula["ruby_source_path"],
-            tap_git_head = formula["tap_git_head"],
-            runtime_dependencies = M.runtime_deps(formula, M.current_os()),
-        })
+function M.have_curl()
+    if _have_curl == nil then
+        local ok, _ = pcall(cmd.exec, "command -v curl >/dev/null 2>&1")
+        _have_curl = ok
     end
-    M.refresh_opt_link(paths, name, keg_ver)
-    return keg_dir
+    return _have_curl
 end
 
--- Install a formula + its runtime closure, deps-first. Returns main keg_dir.
-function M.install_with_deps(name, paths, stack)
-    stack = stack or {}
-    if stack[name] then
-        error("truebrew: dependency cycle detected at '" .. name .. "'")
+function M.parallel_jobs()
+    local n = tonumber(os.getenv("TRUEBREW_JOBS") or os.getenv("MISE_JOBS") or "") or 8
+    if n < 1 then
+        n = 1
+    elseif n > 16 then
+        n = 16
     end
-    stack[name] = true
-    local formula = M.get_formula(name)
+    return n
+end
+
+-- Run shell commands in background batches. Each command must be self-contained
+-- and failure-safe (it records its own failures to a marker file); this raises
+-- only when the batch scaffolding itself breaks.
+function M.run_parallel(commands, max_jobs)
+    if #commands == 0 then
+        return
+    end
+    if #commands == 1 then
+        max_jobs = 1
+    else
+        max_jobs = math.min(max_jobs or M.parallel_jobs(), #commands)
+    end
+    local batch = {}
+    local function flush()
+        if #batch == 0 then
+            return
+        end
+        local script = table.concat(batch, " &\n") .. " &\nwait || true\n"
+        local ok, err = pcall(cmd.exec, script)
+        if not ok then
+            error("truebrew: parallel step failed: " .. tostring(err))
+        end
+        batch = {}
+    end
+    for _, c in ipairs(commands) do
+        table.insert(batch, "( " .. c .. " )")
+        if #batch >= max_jobs then
+            flush()
+        end
+    end
+    flush()
+end
+
+-- Bump when relocation semantics change; older kegs are re-poured automatically.
+M.RELOCATE_VERSION = 2
+
+M._prefetch_seq = 0
+
+-- Ensure formula JSONs for `names` are in the in-memory cache, fetching any
+-- missing ones concurrently via curl (serial Lua fallback otherwise).
+function M.ensure_formulas_cached(names, paths)
+    local missing = {}
+    for _, n in ipairs(names) do
+        local key = M.normalize_tool(n)
+        if not formula_cache[key] then
+            table.insert(missing, key)
+        end
+    end
+    if #missing == 0 then
+        return
+    end
+    if M.have_curl() and #missing > 1 then
+        M._prefetch_seq = M._prefetch_seq + 1
+        local failfile = M.join(paths.cache_meta, "prefetch-" .. M._prefetch_seq .. ".FAIL")
+        local dests = {}
+        local cmds = {}
+        for i, key in ipairs(missing) do
+            local dest = M.join(paths.cache_meta, "prefetch-" .. M._prefetch_seq .. "-" .. i .. ".json")
+            dests[key] = dest
+            table.insert(
+                cmds,
+                "curl -fsSL --retry 2 --retry-delay 1 "
+                    .. "-H "
+                    .. M.shquote("User-Agent: mise-truebrew/0.1.0")
+                    .. " -H "
+                    .. M.shquote("Accept: application/json")
+                    .. " -o "
+                    .. M.shquote(dest)
+                    .. " "
+                    .. M.shquote(M.API_BASE .. "/formula/" .. key .. ".json")
+                    .. " || echo "
+                    .. M.shquote(key)
+                    .. " >> "
+                    .. M.shquote(failfile)
+            )
+        end
+        pcall(cmd.exec, "rm -f " .. M.shquote(failfile))
+        M.run_parallel(cmds, M.parallel_jobs())
+        for _, key in ipairs(missing) do
+            local dest = dests[key]
+            if file.exists(dest) then
+                local ok, content = pcall(file.read, dest)
+                pcall(cmd.exec, "rm -f " .. M.shquote(dest))
+                if ok and content then
+                    local ok2, data = pcall(json.decode, content)
+                    if
+                        ok2
+                        and type(data) == "table"
+                        and type(data["versions"]) == "table"
+                        and data["versions"]["stable"]
+                        and not data["disabled"]
+                    then
+                        formula_cache[key] = data
+                    end
+                end
+            end
+            if not formula_cache[key] then
+                -- Serial fallback: precise error (e.g. unknown formula) or success.
+                M.get_formula(key)
+            end
+        end
+        pcall(cmd.exec, "rm -f " .. M.shquote(failfile))
+    else
+        for _, key in ipairs(missing) do
+            M.get_formula(key)
+        end
+    end
+end
+
+-- Resolve the full runtime closure, deps-first. Metadata is warmed level by
+-- level (parallel fetches); ordering is a cache-hot DFS post-order.
+function M.resolve_closure(root_name, paths)
     local os_name = M.current_os()
-    for _, dep in ipairs(M.runtime_deps(formula, os_name)) do
-        M.install_with_deps(dep, paths, stack)
+    local root_key = M.normalize_tool(root_name)
+    local seen = { [root_key] = true }
+    local levels = { { root_key } }
+    local i = 1
+    while i <= #levels do
+        M.ensure_formulas_cached(levels[i], paths)
+        local next_level = {}
+        for _, key in ipairs(levels[i]) do
+            for _, d in ipairs(M.runtime_deps(formula_cache[key], os_name)) do
+                local dk = M.normalize_tool(d)
+                if not seen[dk] then
+                    seen[dk] = true
+                    table.insert(next_level, dk)
+                end
+            end
+        end
+        if #next_level > 0 then
+            table.insert(levels, next_level)
+        end
+        i = i + 1
     end
-    stack[name] = nil
-    return M.install_keg(formula["name"] or name, formula, paths)
+    local order, state = {}, {}
+    local function visit(key)
+        if state[key] == "done" then
+            return
+        end
+        if state[key] == "visiting" then
+            error("truebrew: dependency cycle detected at '" .. key .. "'")
+        end
+        state[key] = "visiting"
+        local f = formula_cache[key]
+        for _, d in ipairs(M.runtime_deps(f, os_name)) do
+            visit(M.normalize_tool(d))
+        end
+        state[key] = "done"
+        table.insert(order, { key = key, name = f["name"] or key, formula = f })
+    end
+    visit(root_key)
+    return order
+end
+
+-- Ensure bottle blobs for closure items exist on disk. The bulk transfer runs
+-- in parallel; sha256 verification stays serial (fast, local,
+-- security-critical). Falls back to serial Lua downloads without curl.
+function M.ensure_blobs(items, paths)
+    if #items == 0 then
+        return
+    end
+    M.ensure_dirs(paths)
+    local missing = {}
+    for _, item in ipairs(items) do
+        local blob = M.join(paths.cache_blobs, item.sha .. ".tar.gz")
+        item.blob = blob
+        if file.exists(blob) then
+            if M.sha256_of(blob) == item.sha then
+                log.info("truebrew: cached bottle " .. blob)
+            else
+                log.warn("truebrew: cached blob checksum mismatch, re-downloading " .. blob)
+                pcall(cmd.exec, "rm -f " .. M.shquote(blob))
+                table.insert(missing, item)
+            end
+        else
+            table.insert(missing, item)
+        end
+    end
+    if #missing == 0 then
+        return
+    end
+    if not M.have_curl() then
+        for _, item in ipairs(missing) do
+            M.download_bottle(item.entry["url"], item.sha, item.blob)
+        end
+        return
+    end
+    -- Tokens are tiny serial fetches; the bulk transfer below is parallel.
+    for _, item in ipairs(missing) do
+        item.token = M.ghcr_token(M.ghcr_repo_from_url(item.entry["url"]))
+    end
+    local failfile = M.join(paths.cache_blobs, "fetch.FAIL")
+    pcall(cmd.exec, "rm -f " .. M.shquote(failfile))
+    local cmds = {}
+    for _, item in ipairs(missing) do
+        table.insert(
+            cmds,
+            "curl -fsSL --retry 2 --retry-delay 1 "
+                .. "-H "
+                .. M.shquote("User-Agent: mise-truebrew/0.1.0")
+                .. " -H "
+                .. M.shquote("Accept: application/octet-stream")
+                .. " -H "
+                .. M.shquote("Authorization: Bearer " .. item.token)
+                .. " -o "
+                .. M.shquote(item.blob .. ".tmp")
+                .. " "
+                .. M.shquote(item.entry["url"])
+                .. " && mv "
+                .. M.shquote(item.blob .. ".tmp")
+                .. " "
+                .. M.shquote(item.blob)
+                .. " || echo "
+                .. M.shquote(item.name)
+                .. " >> "
+                .. M.shquote(failfile)
+        )
+    end
+    log.info(
+        "truebrew: downloading "
+            .. #missing
+            .. " bottles in parallel (x"
+            .. math.min(M.parallel_jobs(), #missing)
+            .. ")"
+    )
+    M.run_parallel(cmds, M.parallel_jobs())
+    local ok, content = pcall(file.read, failfile)
+    pcall(cmd.exec, "rm -f " .. M.shquote(failfile))
+    if ok and content and M.trim(content) ~= "" then
+        local failed = M.trim(content):gsub("\n", ", ")
+        error("truebrew: failed to download bottles for: " .. failed)
+    end
+    for _, item in ipairs(missing) do
+        if not file.exists(item.blob) then
+            error("truebrew: bottle download missing for '" .. item.name .. "' (no error recorded)")
+        end
+        if M.sha256_of(item.blob) ~= item.sha then
+            pcall(cmd.exec, "rm -f " .. M.shquote(item.blob))
+            error("truebrew: sha256 mismatch for '" .. item.name .. "' bottle. Refusing to install.")
+        end
+    end
+end
+
+-- Pour one closure keg from its verified blob. Serial: extraction and
+-- relocation are correctness-critical local work.
+function M.pour_keg(item, paths)
+    local name = item.name
+    if file.exists(item.keg_dir) then
+        M.refresh_opt_link(paths, name, item.keg_ver)
+        return
+    end
+    log.info("truebrew: pouring " .. name .. " " .. item.keg_ver .. " (" .. item.tag .. ")")
+    local ok, err = pcall(cmd.exec, "tar -xzf " .. M.shquote(item.blob) .. " -C " .. M.shquote(paths.cellar))
+    if not ok then
+        error("truebrew: extraction failed for " .. name .. ": " .. tostring(err))
+    end
+    if not file.exists(item.keg_dir) then
+        error("truebrew: bottle for " .. name .. " did not contain expected keg " .. name .. "/" .. item.keg_ver)
+    end
+    M.relocate_keg(item.keg_dir, paths.prefix, paths.cellar)
+    M.write_keg_receipt(item.keg_dir, {
+        name = name,
+        keg_version = item.keg_ver,
+        stable = M.stable_version(item.formula),
+        bottle_tag = item.tag,
+        bottle_url = item.entry["url"],
+        sha256 = item.sha,
+        relocate_version = M.RELOCATE_VERSION,
+        prefix = paths.prefix,
+        cellar = paths.cellar,
+        ruby_source_path = item.formula["ruby_source_path"],
+        tap_git_head = item.formula["tap_git_head"],
+        runtime_dependencies = M.runtime_deps(item.formula, M.current_os()),
+    })
+    M.refresh_opt_link(paths, name, item.keg_ver)
+end
+
+-- Install a formula + its runtime closure, deps-first. Network phases
+-- (metadata, bottle downloads) run in parallel; pours stay serial.
+-- Returns main keg_dir.
+function M.install_with_deps(name, paths, stack)
+    local t0 = os.time()
+    M.ensure_dirs(paths)
+    local order = M.resolve_closure(name, paths)
+    local need = {}
+    for _, item in ipairs(order) do
+        local tag, entry = M.select_bottle(item.formula)
+        item.tag = tag
+        item.entry = entry
+        item.keg_ver = M.keg_version(item.formula)
+        item.keg_dir = M.keg_dir(paths, item.name, item.keg_ver)
+        item.sha = tostring(entry["sha256"]):lower()
+        local receipt = M.read_keg_receipt(item.keg_dir)
+        if
+            receipt
+            and receipt["sha256"] == item.sha
+            and receipt["relocate_version"] == M.RELOCATE_VERSION
+            and file.exists(item.keg_dir)
+        then
+            log.info("truebrew: already installed " .. item.name .. " " .. item.keg_ver)
+            M.refresh_opt_link(paths, item.name, item.keg_ver)
+            item.done = true
+        else
+            if receipt and receipt["sha256"] == item.sha and file.exists(item.keg_dir) then
+                -- Same bottle, outdated relocation (e.g. fixed placeholder
+                -- handling): re-pour from the cached blob.
+                log.info("truebrew: re-pouring " .. item.name .. " with current relocation")
+                pcall(cmd.exec, "rm -rf " .. M.shquote(item.keg_dir))
+            elseif file.exists(item.keg_dir) and receipt == nil then
+                -- Foreign/partial dir: only reuse when it looks complete.
+                if not file.exists(M.join(item.keg_dir, "INSTALL_RECEIPT.json")) then
+                    log.warn("truebrew: removing incomplete keg dir " .. item.keg_dir)
+                    pcall(cmd.exec, "rm -rf " .. M.shquote(item.keg_dir))
+                end
+            end
+            table.insert(need, item)
+        end
+    end
+    log.info(
+        "truebrew: closure for '"
+            .. name
+            .. "': "
+            .. #order
+            .. " kegs ("
+            .. #need
+            .. " to pour, "
+            .. (os.time() - t0)
+            .. "s resolve)"
+    )
+    local t1 = os.time()
+    M.ensure_blobs(need, paths)
+    log.info("truebrew: bottles ready (" .. (os.time() - t1) .. "s fetch+verify)")
+    local t2 = os.time()
+    for _, item in ipairs(need) do
+        M.pour_keg(item, paths)
+    end
+    log.info("truebrew: poured " .. #need .. " kegs (" .. (os.time() - t2) .. "s pour)")
+    return order[#order].keg_dir
 end
 
 -- ---------------------------------------------------------------------------
