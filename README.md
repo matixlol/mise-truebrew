@@ -93,7 +93,7 @@ mise-managed toolchains), plus `LD_LIBRARY_PATH` on Linux.
 - Search/discovery hooks (`backend_list_tools`, `backend_search_tools`) follow
   the plugin spec (curated catalog + formulae-index search). The search index
   is cached for 24 hours in `<truebrew root>/cache/meta/formula-index.json`,
-  shared across queries; delete that file to force a refresh. Older mise
+  shared across queries. Older mise
   CLIs only query the static registry for `mise search`; browse
   [formulae.brew.sh](https://formulae.brew.sh) for names.
 
@@ -114,7 +114,6 @@ mise-managed toolchains), plus `LD_LIBRARY_PATH` on Linux.
 mise plugin link --force truebrew .
 mise ls-remote truebrew:jq
 ./mise-tasks/test   # or: mise run test
-./mise-tasks/test-search   # search cache regression test; Python 3 + recent mise
 ```
 
 ## License
