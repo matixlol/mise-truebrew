@@ -78,12 +78,6 @@ tool name and version are separate fields:
 provides `LDFLAGS` / `CPPFLAGS` / `PKG_CONFIG_PATH` / `MANPATH` pointing at the
 shared prefix (so keg-only libraries like `openssl@3` are usable from
 mise-managed toolchains), plus `LD_LIBRARY_PATH` on Linux.
-When ncurses is installed, it also adds its relocated terminal database to
-`TERMINFO_DIRS`, preserving existing search paths and `TERMINFO` overrides.
-This lets terminal applications such as `ncdu` find their terminal descriptions
-without relying on a Homebrew installation at its original build prefix.
-Mise caches the environment hook: after updating the plugin or changing
-`TERMINFO_DIRS`, run `mise cache clear truebrew:<formula>` to refresh it.
 
 ## Limitations (v1, by design)
 
