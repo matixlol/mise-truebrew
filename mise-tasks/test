@@ -38,4 +38,12 @@ env -u TERMINFO TERMINFO_DIRS=/nonexistent/custom-terminfo mise exec truebrew:nc
     'case "$TERMINFO_DIRS" in /nonexistent/custom-terminfo:*) ;; *) exit 1 ;; esac; "$(dirname "$TRUEBREW_OPT_NCDU")/ncurses/bin/infocmp" xterm-256color >/dev/null'
 mise cache clear truebrew:ncdu
 
+echo "-- ncurses launcher with a sudo-like environment --"
+mise install --force truebrew:ncurses@latest
+ncurses_install="$(mise where truebrew:ncurses@latest)"
+# Run directly, bypassing mise's environment hook as sudo does.
+env -u TERMINFO -u TERMINFO_DIRS "$ncurses_install/bin/infocmp" xterm-256color >/dev/null
+env -u TERMINFO TERMINFO_DIRS=/nonexistent/custom-terminfo \
+    "$ncurses_install/bin/infocmp" xterm-256color >/dev/null
+
 echo "OK"
