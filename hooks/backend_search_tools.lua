@@ -1,7 +1,7 @@
 --- hooks/backend_search_tools.lua
 --- Query-driven search over homebrew-core formulae.
 --- Strategy: exact formula lookup first (fast), then substring filter over
---- the full formulae index (31MB, cached per-query by mise).
+--- the full formulae index (shared on disk across queries and mise processes).
 
 local function load_helper()
     if RUNTIME ~= nil and RUNTIME.pluginDirPath ~= nil then
@@ -12,7 +12,6 @@ end
 
 function PLUGIN:BackendSearchTools(ctx)
     local tb = load_helper()
-    local log = require("log")
     local q = (ctx.query or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
     if q == "" then
         return { tools = {} }
@@ -29,8 +28,7 @@ function PLUGIN:BackendSearchTools(ctx)
     end
 
     -- 2. Substring search over the full index.
-    log.info("truebrew: searching formulae index for '" .. q .. "' (one-time ~30MB download)")
-    local data = tb.get_json(tb.API_BASE .. "/formula.json")
+    local data = tb.get_formula_index()
     if type(data) ~= "table" then
         return { tools = {} }
     end

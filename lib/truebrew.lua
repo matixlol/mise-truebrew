@@ -150,6 +150,79 @@ end
 
 local formula_cache = {}
 
+-- mise caches search results per query, but the source index must be shared
+-- across queries/processes. Keep only the fields used by search on disk.
+M.FORMULA_INDEX_TTL = 24 * 60 * 60
+
+local function valid_formula_index(data)
+    if type(data) ~= "table" or #data == 0 then
+        return false
+    end
+    for _, formula in ipairs(data) do
+        if type(formula) ~= "table" or type(formula.name) ~= "string" then
+            return false
+        end
+    end
+    return true
+end
+
+function M.get_formula_index()
+    local paths = M.paths()
+    local cache_path = M.join(paths.cache_meta, "formula-index.json")
+    local fh = io.open(cache_path, "r")
+    if fh then
+        local content = fh:read("*a")
+        fh:close()
+        local ok, cached = pcall(json.decode, content or "")
+        if ok and type(cached) == "table" and type(cached.updated_at) == "number" then
+            local age = os.time() - cached.updated_at
+            if age >= 0 and age < M.FORMULA_INDEX_TTL and valid_formula_index(cached.formulae) then
+                return cached.formulae
+            end
+        end
+    end
+
+    log.info("truebrew: downloading formulae index (~30MB; cached for 24 hours)")
+    local data = M.get_json(M.API_BASE .. "/formula.json")
+    if not valid_formula_index(data) then
+        error("truebrew: invalid formulae index from " .. M.API_BASE)
+    end
+    local index = {}
+    for _, formula in ipairs(data) do
+        table.insert(index, { name = formula.name, desc = tostring(formula.desc or "") })
+    end
+    local encoded = json.encode({ updated_at = os.time(), formulae = index })
+    -- Unique temporary files keep concurrent writers from interfering; rename
+    -- publishes only a complete index. Cache failures must not break search.
+    local tmp = M.trim(
+        cmd.exec(
+            "mkdir -p "
+                .. M.shquote(paths.cache_meta)
+                .. " && mktemp "
+                .. M.shquote(cache_path .. ".XXXXXX")
+                .. " || true"
+        )
+    )
+    local saved = false
+    if tmp ~= "" then
+        local out = io.open(tmp, "w")
+        if out then
+            local written = out:write(encoded)
+            local closed = out:close()
+            if written and closed then
+                saved = os.rename(tmp, cache_path)
+            end
+        end
+        if not saved then
+            os.remove(tmp)
+        end
+    end
+    if not saved then
+        log.warn("truebrew: could not cache formulae index at " .. cache_path)
+    end
+    return index
+end
+
 -- Normalize user input: strip tap prefix ("homebrew/core/wget" -> "wget").
 function M.normalize_tool(tool)
     if not tool or tool == "" then
