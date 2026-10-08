@@ -8,6 +8,9 @@ PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 echo "== truebrew e2e =="
 echo "plugin: $PLUGIN_DIR"
 
+echo "-- search cache regression --"
+python3 "$PLUGIN_DIR/tests/search_cache.py"
+
 mise plugin link --force truebrew "$PLUGIN_DIR"
 
 echo "-- ls-remote truebrew:jq --"

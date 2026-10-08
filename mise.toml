@@ -6,5 +6,5 @@ lua = "5.1"
 always_keep_download = false
 
 [tasks.test]
-description = "End-to-end smoke test: link plugin, install jq + deps, run it"
+description = "Search cache regression and end-to-end installation smoke tests"
 run = "./mise-tasks/test"

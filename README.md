@@ -91,7 +91,9 @@ mise-managed toolchains), plus `LD_LIBRARY_PATH` on Linux.
 - `post_install` steps, services, and `brew link` conflict semantics are not
   replicated — each mise tool gets an isolated shim instead.
 - Search/discovery hooks (`backend_list_tools`, `backend_search_tools`) follow
-  the plugin spec (curated catalog + formulae-index search), but older mise
+  the plugin spec (curated catalog + formulae-index search). The search index
+  is cached for 24 hours in `<truebrew root>/cache/meta/formula-index.json`,
+  shared across queries. Older mise
   CLIs only query the static registry for `mise search`; browse
   [formulae.brew.sh](https://formulae.brew.sh) for names.
 
