@@ -24,4 +24,18 @@ echo "-- install truebrew:ripgrep (dep: pcre2) --"
 mise install truebrew:ripgrep@latest
 mise exec truebrew:ripgrep@latest -- rg --version
 
+echo "-- install truebrew:ncdu (dep: ncurses) --"
+mise install truebrew:ncdu@latest
+# Unlike --version, infocmp actually loads a terminal description through the
+# dependency's ncurses library. Test with no inherited database configuration.
+mise cache clear truebrew:ncdu
+env -u TERMINFO -u TERMINFO_DIRS mise exec truebrew:ncdu@latest -- sh -c \
+    '"$(dirname "$TRUEBREW_OPT_NCDU")/ncurses/bin/infocmp" xterm-256color >/dev/null'
+# A user-supplied search path must remain usable alongside truebrew's database.
+# mise caches hook results, so refresh between distinct input environments.
+mise cache clear truebrew:ncdu
+env -u TERMINFO TERMINFO_DIRS=/nonexistent/custom-terminfo mise exec truebrew:ncdu@latest -- sh -c \
+    'case "$TERMINFO_DIRS" in /nonexistent/custom-terminfo:*) ;; *) exit 1 ;; esac; "$(dirname "$TRUEBREW_OPT_NCDU")/ncurses/bin/infocmp" xterm-256color >/dev/null'
+mise cache clear truebrew:ncdu
+
 echo "OK"
