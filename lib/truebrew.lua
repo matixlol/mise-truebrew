@@ -1032,9 +1032,53 @@ end
 -- mise shim (install_path)
 -- ---------------------------------------------------------------------------
 
+-- Use installed receipts to cover direct and transitive ncurses dependencies,
+-- including relinks of older kegs, without fetching current formula metadata.
+function M.uses_ncurses(keg_dir, prefix, seen)
+    seen = seen or {}
+    if seen[keg_dir] then
+        return false
+    end
+    seen[keg_dir] = true
+    local receipt = M.read_keg_receipt(keg_dir)
+    if not receipt then
+        return false
+    end
+    if receipt.name == "ncurses" then
+        return true
+    end
+    for _, dep in ipairs(receipt.runtime_dependencies or {}) do
+        if dep == "ncurses" or M.uses_ncurses(M.join(prefix, "opt", dep), prefix, seen) then
+            return true
+        end
+    end
+    return false
+end
+
+function M.write_terminfo_launcher(dest, src, terminfo)
+    local fh, err = io.open(dest, "w")
+    if not fh then
+        error("truebrew: cannot write launcher " .. dest .. ": " .. tostring(err))
+    end
+    fh:write("#!/bin/sh\n")
+    fh:write("# Restore the relocated database even when sudo drops the environment.\n")
+    fh:write("truebrew_terminfo=" .. M.shquote(terminfo) .. "\n")
+    fh:write('if [ -d "$truebrew_terminfo" ]; then\n')
+    fh:write('    case ":${TERMINFO_DIRS-}:" in\n')
+    fh:write('        *":$truebrew_terminfo:"*) ;;\n')
+    fh:write('        *) TERMINFO_DIRS="${TERMINFO_DIRS:+$TERMINFO_DIRS:}$truebrew_terminfo:"; export TERMINFO_DIRS ;;\n')
+    fh:write("    esac\nfi\n")
+    fh:write("exec " .. M.shquote(src) .. ' "$@"\n')
+    fh:close()
+    cmd.exec("chmod 755 " .. M.shquote(dest))
+end
+
 function M.write_shim(install_path, keg_dir, meta)
     pcall(cmd.exec, "mkdir -p " .. M.shquote(M.join(install_path, "bin")))
-    -- Link keg executables (bin + sbin) into the shim.
+    local terminfo = M.join(meta.prefix, "opt", "ncurses", "share", "terminfo")
+    local needs_terminfo = M.uses_ncurses(keg_dir, meta.prefix)
+    -- Ncurses consumers need a launcher: sudo can bypass BackendExecEnv.
+    -- Other executables keep their direct symlinks.
     for _, sub in ipairs({ "bin", "sbin" }) do
         local src_dir = M.join(keg_dir, sub)
         if file.exists(src_dir) then
@@ -1043,10 +1087,14 @@ function M.write_shim(install_path, keg_dir, meta)
                 local dest = M.join(install_path, "bin", base)
                 if M.is_file_like(src) then
                     pcall(cmd.exec, "rm -f " .. M.shquote(dest))
-                    local ok2, err2 =
-                        pcall(cmd.exec, "ln -s " .. M.shquote(src) .. " " .. M.shquote(dest))
-                    if not ok2 then
-                        error("truebrew: cannot link " .. base .. ": " .. tostring(err2))
+                    if needs_terminfo then
+                        M.write_terminfo_launcher(dest, src, terminfo)
+                    else
+                        local ok2, err2 =
+                            pcall(cmd.exec, "ln -s " .. M.shquote(src) .. " " .. M.shquote(dest))
+                        if not ok2 then
+                            error("truebrew: cannot link " .. base .. ": " .. tostring(err2))
+                        end
                     end
                 end
             end
