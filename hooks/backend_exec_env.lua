@@ -41,6 +41,22 @@ function PLUGIN:BackendExecEnv(ctx)
     add("PKG_CONFIG_PATH", tb.join(paths.prefix, "share", "pkgconfig"))
     add("MANPATH", tb.join(paths.prefix, "share", "man"))
 
+    -- Bottle libraries retain their compiled-in Homebrew terminfo location.
+    -- Use the stable opt link so ncurses consumers (e.g. ncdu) can find the
+    -- relocated database, including when ncurses is only a dependency.
+    local terminfo = tb.join(paths.opt, "ncurses", "share", "terminfo")
+    if file.exists(terminfo) then
+        local existing = os.getenv("TERMINFO_DIRS") or ""
+        -- Preserve user search order and empty entries (default locations).
+        -- Avoid adding the same path again when multiple tools are active.
+        if not (":" .. existing .. ":"):find(":" .. terminfo .. ":", 1, true) then
+            if existing ~= "" then
+                existing = existing .. ":"
+            end
+            add("TERMINFO_DIRS", existing .. terminfo .. ":")
+        end
+    end
+
     -- Linux dynamic loader fallback for any ELF RPATH we could not rewrite.
     if tb.current_os() == "linux" then
         add("LD_LIBRARY_PATH", tb.join(paths.prefix, "lib"))
