@@ -795,7 +795,7 @@ function M.run_parallel(commands, max_jobs)
 end
 
 -- Bump when relocation semantics change; older kegs are re-poured automatically.
-M.RELOCATE_VERSION = 2
+M.RELOCATE_VERSION = 3
 
 M._prefetch_seq = 0
 
@@ -1034,6 +1034,8 @@ function M.pour_keg(item, paths)
         ruby_source_path = item.formula["ruby_source_path"],
         tap_git_head = item.formula["tap_git_head"],
         runtime_dependencies = M.runtime_deps(item.formula, M.current_os()),
+        -- The API only serves the current version's steps; keep this keg's.
+        post_install_steps = item.formula["post_install_steps"] or {},
     })
     M.refresh_opt_link(paths, name, item.keg_ver)
 end
@@ -1098,16 +1100,19 @@ function M.install_with_deps(name, paths, stack)
         M.pour_keg(item, paths)
     end
     log.info("truebrew: poured " .. #need .. " kegs (" .. (os.time() - t2) .. "s pour)")
+    for i, item in ipairs(order) do
+        M.ensure_post_install(item, paths, i == #order)
+    end
     return order[#order].keg_dir
 end
 
 -- ---------------------------------------------------------------------------
--- mise shim (install_path)
+-- dependency queries
 -- ---------------------------------------------------------------------------
 
--- Use installed receipts to cover direct and transitive ncurses dependencies,
+-- Use installed receipts to cover direct and transitive dependencies,
 -- including relinks of older kegs, without fetching current formula metadata.
-function M.uses_ncurses(keg_dir, prefix, seen)
+function M.uses_dep(keg_dir, prefix, matches, seen)
     seen = seen or {}
     if seen[keg_dir] then
         return false
@@ -1117,30 +1122,645 @@ function M.uses_ncurses(keg_dir, prefix, seen)
     if not receipt then
         return false
     end
-    if receipt.name == "ncurses" then
+    if matches(receipt.name) then
         return true
     end
     for _, dep in ipairs(receipt.runtime_dependencies or {}) do
-        if dep == "ncurses" or M.uses_ncurses(M.join(prefix, "opt", dep), prefix, seen) then
+        if matches(dep) or M.uses_dep(M.join(prefix, "opt", dep), prefix, matches, seen) then
             return true
         end
     end
     return false
 end
 
-function M.write_terminfo_launcher(dest, src, terminfo)
+function M.is_openssl(name)
+    return name == "openssl" or tostring(name):match("^openssl@") ~= nil
+end
+
+function M.uses_ncurses(keg_dir, prefix)
+    return M.uses_dep(keg_dir, prefix, function(name)
+        return name == "ncurses"
+    end)
+end
+
+function M.uses_openssl(keg_dir, prefix)
+    return M.uses_dep(keg_dir, prefix, M.is_openssl)
+end
+
+-- ---------------------------------------------------------------------------
+-- post_install_steps (Homebrew's declarative post-install, served by the API)
+-- ---------------------------------------------------------------------------
+-- Bottles never ship etc/ or var/; formulae populate them (and fix up their
+-- kegs) in post_install. Homebrew serialises that as data, so this mirrors
+-- Homebrew::InstallSteps::Runner. Actions that wrap Ruby logic, need sudo,
+-- or start services are skipped with a warning.
+
+-- Bump when step semantics change; kegs re-run their steps on next install.
+M.POST_INSTALL_VERSION = 1
+
+function M.ca_bundle(prefix)
+    return M.join(prefix, "etc", "ca-certificates", "cert.pem")
+end
+
+local Q = M.shquote
+
+local function sh_ok(script)
+    return (pcall(cmd.exec, script))
+end
+
+local function exists(p)
+    return sh_ok("test -e " .. Q(p))
+end
+
+local function is_link(p)
+    return sh_ok("test -L " .. Q(p))
+end
+
+local function is_dir(p)
+    return sh_ok("test -d " .. Q(p))
+end
+
+local function dirname(p)
+    return p:gsub("/+$", ""):match("^(.*)/[^/]*$") or "."
+end
+
+local function basename(p)
+    return (p:gsub("/+$", ""):match("([^/]*)$"))
+end
+
+local function mkdir_p(p)
+    cmd.exec("mkdir -p " .. Q(p))
+end
+
+-- Tokens usable inside templated strings (Runner::CONTENT_PATH_TOKENS).
+local CONTENT_PATH_TOKENS = {
+    prefix = true,
+    opt_prefix = true,
+    bin = true,
+    sbin = true,
+    lib = true,
+    libexec = true,
+    share = true,
+    pkgshare = true,
+    var = true,
+    etc = true,
+    pkgetc = true,
+    temp = true,
+    rack = true,
+    bash_completion = true,
+    zsh_completion = true,
+    fish_completion = true,
+    pwsh_completion = true,
+}
+
+function M.post_install_context(item, paths)
+    local keg = item.keg_dir
+    local name = item.name
+    local version = M.stable_version(item.formula)
+    local major, minor = version:match("^(%d+)%.?(%d*)")
+    local share = M.join(keg, "share")
+    local etc = M.join(paths.prefix, "etc")
+    return {
+        name = name,
+        version = version,
+        version_major = major,
+        version_major_minor = (major and minor ~= "") and (major .. "." .. minor) or major,
+        paths = paths,
+        guards = {},
+        roots = {
+            prefix = keg,
+            opt_prefix = M.join(paths.opt, name),
+            bin = M.join(keg, "bin"),
+            sbin = M.join(keg, "sbin"),
+            lib = M.join(keg, "lib"),
+            libexec = M.join(keg, "libexec"),
+            include = M.join(keg, "include"),
+            frameworks = M.join(keg, "Frameworks"),
+            share = share,
+            pkgshare = M.join(share, name),
+            man = M.join(share, "man"),
+            doc = M.join(share, "doc", name),
+            etc = etc,
+            pkgetc = M.join(etc, name),
+            var = M.join(paths.prefix, "var"),
+            rack = M.join(paths.cellar, name),
+            homebrew_prefix = paths.prefix,
+            temp = os.getenv("TMPDIR") or "/tmp",
+            home = M.home(),
+            bash_completion = M.join(keg, "etc", "bash_completion.d"),
+            zsh_completion = M.join(share, "zsh", "site-functions"),
+            fish_completion = M.join(share, "fish", "vendor_completions.d"),
+            pwsh_completion = M.join(share, "pwsh", "completions"),
+        },
+    }
+end
+
+-- Unknown tokens stay verbatim, as in Homebrew.
+function M.expand_tokens(ctx, s)
+    return (tostring(s):gsub("{{([%a_][%w_.]*)}}", function(tok)
+        if tok == "HOMEBREW_PREFIX" then
+            return ctx.paths.prefix
+        elseif tok == "HOMEBREW_CELLAR" then
+            return ctx.paths.cellar
+        elseif tok == "formula_name" or tok == "name" then
+            return ctx.name
+        elseif tok == "user" then
+            return os.getenv("USER")
+        elseif tok == "version" then
+            return ctx.version
+        elseif tok == "version.major" then
+            return ctx.version_major
+        elseif tok == "version.major_minor" then
+            return ctx.version_major_minor
+        elseif CONTENT_PATH_TOKENS[tok] then
+            return ctx.roots[tok]
+        end
+        return nil
+    end))
+end
+
+function M.step_path(ctx, spec)
+    local path = M.expand_tokens(ctx, spec["path"])
+    local base = spec["base"]
+    if base == nil or base == "" or base == "absolute" or base == "relative" then
+        return path
+    end
+    local root
+    if base == "formula_pkgetc" or base == "formula_opt_prefix" then
+        local formula = tostring(spec["formula"] or ""):match("([^/]+)$")
+        if not formula or formula == "" then
+            error("missing formula for install step base " .. base)
+        end
+        root = base == "formula_pkgetc" and M.join(ctx.paths.prefix, "etc", formula) or M.join(ctx.paths.opt, formula)
+    else
+        root = ctx.roots[base]
+    end
+    if not root then
+        error("unknown install step base: " .. tostring(base))
+    end
+    return root .. "/" .. path
+end
+
+-- Ruby Pathname.glob semantics via bash: braces, `**`, no dotfiles.
+function M.step_glob(ctx, spec)
+    local path = M.step_path(ctx, spec)
+    if not path:find("[%*%?%[{]") then
+        return { path }
+    end
+    local escaped = path:gsub("([^%w%*%?%[%]{},/._%-])", "\\%1")
+    local script = 'shopt -s globstar nullglob; eval "set -- $1"; '
+        .. 'for p; do if [ -e "$p" ] || [ -L "$p" ]; then printf "%s\\n" "$p"; fi; done'
+    local out = cmd.exec("bash -c " .. Q(script) .. " _ " .. Q(escaped))
+    local list = {}
+    for line in tostring(out or ""):gmatch("[^\n]+") do
+        table.insert(list, line)
+    end
+    return list
+end
+
+local function spec_exists(ctx, spec)
+    for _, p in ipairs(M.step_glob(ctx, spec)) do
+        if exists(p) then
+            return true
+        end
+    end
+    return false
+end
+
+-- Guard results are snapshotted once per run, as in Homebrew.
+function M.step_guards_match(ctx, step)
+    for _, guard in ipairs(step["guards"] or {}) do
+        local key = guard["id"] or json.encode(guard)
+        local result = ctx.guards[key]
+        if result == nil then
+            local cond = guard["condition"]
+            if cond == "if_exists" then
+                result = spec_exists(ctx, guard)
+            elseif cond == "unless_exists" then
+                result = not spec_exists(ctx, guard)
+            elseif cond == "on" then
+                local os_name = M.current_os() == "linux" and "linux" or "macos"
+                result = guard["value"] == os_name
+            else
+                result = false
+            end
+            ctx.guards[key] = result
+        end
+        if not result then
+            return false
+        end
+    end
+    return true
+end
+
+local function step_source(ctx, step)
+    if step["source_glob"] ~= true then
+        return M.step_path(ctx, step["source"])
+    end
+    local sources = M.step_glob(ctx, step["source"])
+    if #sources ~= 1 then
+        error("install step source glob must match exactly one path: " .. M.step_path(ctx, step["source"]))
+    end
+    return sources[1]
+end
+
+local function step_destination(source, target)
+    return is_dir(target) and (target .. "/" .. basename(source)) or target
+end
+
+local function step_paths(ctx, step)
+    local list = {}
+    for _, spec in ipairs(step["paths"] or {}) do
+        for _, p in ipairs(M.step_glob(ctx, spec)) do
+            table.insert(list, p)
+        end
+    end
+    return list
+end
+
+local function create_symlink(source, target, step)
+    if step["sudo"] == true then
+        error("requires sudo")
+    end
+    mkdir_p(dirname(target))
+    if step["force"] == true then
+        pcall(cmd.exec, "rm -f " .. Q(target))
+    end
+    if exists(target) or is_link(target) then
+        error("file exists: " .. target)
+    end
+    cmd.exec("ln -s " .. Q(source) .. " " .. Q(target))
+end
+
+local function write_atomic(path, content)
+    mkdir_p(dirname(path))
+    local tmp = path .. ".truebrew-tmp"
+    local fh, err = io.open(tmp, "w")
+    if not fh then
+        error("cannot write " .. path .. ": " .. tostring(err))
+    end
+    fh:write(content)
+    fh:close()
+    cmd.exec("mv -f " .. Q(tmp) .. " " .. Q(path))
+end
+
+-- Not implemented: glib/gtk/mime/desktop cache rebuilds index
+-- <prefix>/share, which only `brew link` populates; truebrew never links kegs
+-- into the prefix, so running them would record success over an empty index.
+
+-- Same fallback as relocate.sh for an unusable xcrun-backed otool shim.
+local function macho_tool_env()
+    if sh_ok("otool -h /bin/ls >/dev/null 2>&1") then
+        return ""
+    end
+    return "DEVELOPER_DIR=/Library/Developer/CommandLineTools "
+end
+
+M.POST_INSTALL_STEPS = {
+    mkdir = function(ctx, step)
+        cmd.exec("mkdir " .. Q(M.step_path(ctx, step["path"])))
+    end,
+    mkdir_p = function(ctx, step)
+        mkdir_p(M.step_path(ctx, step["path"]))
+    end,
+    touch = function(ctx, step)
+        local p = M.step_path(ctx, step["path"])
+        mkdir_p(dirname(p))
+        cmd.exec("touch " .. Q(p))
+    end,
+    move = function(ctx, step)
+        local source = step_source(ctx, step)
+        local target = M.step_path(ctx, step["target"])
+        mkdir_p(dirname(target))
+        if step["overwrite"] ~= nil then
+            local destination = step_destination(source, target)
+            local overwrite = step["overwrite"] == true or step["force"] == true
+            if exists(destination) and not overwrite then
+                error("file exists: " .. destination)
+            end
+            if overwrite and destination ~= source and (exists(source) or is_link(source)) then
+                cmd.exec("rm -rf " .. Q(destination))
+            end
+            cmd.exec("mv " .. Q(source) .. " " .. Q(target))
+        else
+            cmd.exec("mv " .. (step["force"] == true and "-f " or "") .. Q(source) .. " " .. Q(target))
+        end
+    end,
+    move_children = function(ctx, step)
+        local script = 'mkdir -p "$2" && for c in "$1"/* "$1"/.[!.]* "$1"/..?*; do '
+            .. '{ [ -e "$c" ] || [ -L "$c" ]; } && [ "$c" != "$2" ] && mv "$c" "$2"/; done; true'
+        cmd.exec(
+            "sh -c "
+                .. Q(script)
+                .. " _ "
+                .. Q(M.step_path(ctx, step["source"]))
+                .. " "
+                .. Q(M.step_path(ctx, step["target"]))
+        )
+    end,
+    copy = function(ctx, step)
+        local source = step_source(ctx, step)
+        local target = M.step_path(ctx, step["target"])
+        mkdir_p(dirname(target))
+        local destination = step_destination(source, target)
+        local overwrite = step["overwrite"] ~= false
+        if exists(destination) and not overwrite then
+            error("file exists: " .. destination)
+        end
+        if step["recursive"] == true then
+            cmd.exec("cp -R " .. Q(source) .. " " .. Q(target))
+        else
+            if overwrite and is_link(destination) then
+                cmd.exec("rm -f " .. Q(destination))
+            end
+            cmd.exec("cp " .. Q(source) .. " " .. Q(target))
+        end
+    end,
+    remove = function(ctx, step)
+        if step["sudo"] == true then
+            error("requires sudo")
+        end
+        for _, p in ipairs(step_paths(ctx, step)) do
+            local keep = true
+            local needle = step["symlink_target_contains"]
+            if needle then
+                local ok, dest = pcall(cmd.exec, "readlink " .. Q(p))
+                keep = ok and tostring(dest):find(needle, 1, true) ~= nil
+            end
+            needle = step["content_contains"]
+            if keep and needle then
+                local ok, content = pcall(file.read, p)
+                keep = ok and content ~= nil and content:find(needle, 1, true) ~= nil
+            end
+            if keep then
+                cmd.exec((step["recursive"] == true and "rm -rf " or "rm -f ") .. Q(p))
+            end
+        end
+    end,
+    inreplace = function(ctx, step)
+        local pattern = step["regexp"] == true and "$tb_before" or "\\Q$tb_before\\E"
+        -- Ruby's ^ and $ always match at line boundaries; Perl needs /m.
+        local flags = (step["first_only"] == true and "" or "g") .. (step["regexp"] == true and "m" or "")
+        local audit = step["skip_audit"] ~= true and "$tb_n ? 0 : 1" or "0"
+        local script = "BEGIN { $tb_before = $ENV{TB_BEFORE}; $tb_after = $ENV{TB_AFTER}; $tb_n = 0 } "
+            .. ("$tb_n++ if s/" .. pattern .. "/$tb_after/" .. flags .. "; ")
+            .. ("END { exit(" .. audit .. ") }")
+        local ok, err = pcall(
+            cmd.exec,
+            "TB_BEFORE="
+                .. Q(M.expand_tokens(ctx, step["before"]))
+                .. " TB_AFTER="
+                .. Q(M.expand_tokens(ctx, step["after"]))
+                .. " perl -0777 -pi -e "
+                .. Q(script)
+                .. " "
+                .. Q(M.step_path(ctx, step["path"]))
+        )
+        if not ok then
+            error("inreplace failed (no match?): " .. tostring(err))
+        end
+    end,
+    link_dir = function(ctx, step)
+        local script = [[
+src=$1 tgt=$2
+cd "$src" || exit 1
+find . | while IFS= read -r rel; do
+    s="$src/$rel" t="$tgt/$rel"
+    [ "$(basename "$rel")" = .DS_Store ] && continue
+    [ -d "$t" ] && [ ! -L "$t" ] && continue
+    if [ -e "$t" ] || [ -L "$t" ]; then rm -f "$t"; fi
+    if [ -L "$s" ] || [ -f "$s" ]; then
+        mkdir -p "$(dirname "$t")" && ln -s "$s" "$t" || exit 1
+    elif [ -d "$s" ]; then
+        mkdir -p "$t" || exit 1
+    fi
+done]]
+        cmd.exec(
+            "sh -c "
+                .. Q(script)
+                .. " _ "
+                .. Q(M.step_path(ctx, step["source"]))
+                .. " "
+                .. Q(M.step_path(ctx, step["target"]))
+        )
+    end,
+    link_children = function(ctx, step)
+        local script = 'mkdir -p "$2" && for c in "$1"/* "$1"/.[!.]* "$1"/..?*; do '
+            .. '{ [ -e "$c" ] || [ -L "$c" ]; } || continue; '
+            .. 'ln -sfn "$c" "$2/$3$(basename "$c")$4" || exit 1; done'
+        cmd.exec(
+            "sh -c "
+                .. Q(script)
+                .. " _ "
+                .. Q(M.step_path(ctx, step["source"]))
+                .. " "
+                .. Q(M.step_path(ctx, step["target"]))
+                .. " "
+                .. Q(M.expand_tokens(ctx, step["prefix"] or ""))
+                .. " "
+                .. Q(M.expand_tokens(ctx, step["suffix"] or ""))
+        )
+    end,
+    symlink = function(ctx, step)
+        local target = M.step_path(ctx, step["target"])
+        if step["source_glob"] ~= true then
+            create_symlink(M.step_path(ctx, step["source"]), target, step)
+            return
+        end
+        local sources = M.step_glob(ctx, step["source"])
+        if #sources == 0 then
+            return
+        end
+        if #sources > 1 or is_dir(target) then
+            mkdir_p(target)
+            for _, source in ipairs(sources) do
+                create_symlink(source, target .. "/" .. basename(source), step)
+            end
+        else
+            create_symlink(sources[1], target, step)
+        end
+    end,
+    write = function(ctx, step)
+        if step["content"] == nil then
+            error("install step write requires content")
+        end
+        local p = M.step_path(ctx, step["path"])
+        if step["overwrite"] == true or not exists(p) then
+            write_atomic(p, M.expand_tokens(ctx, step["content"]))
+        end
+    end,
+    run = function(ctx, step)
+        if step["sudo"] == true then
+            error("requires sudo")
+        end
+        local spec = step["command"]
+        local line = "env"
+        for k, v in pairs(step["env"] or {}) do
+            line = line .. " " .. Q(k .. "=" .. M.expand_tokens(ctx, v))
+        end
+        line = line .. " " .. Q(M.step_path(ctx, spec))
+        for _, a in ipairs(step["args"] or {}) do
+            line = line .. " " .. Q(M.expand_tokens(ctx, a))
+        end
+        if step["chdir"] then
+            line = "cd " .. Q(M.step_path(ctx, step["chdir"])) .. " && " .. line
+        end
+        if step["stdin_path"] then
+            line = line .. " <" .. Q(M.step_path(ctx, step["stdin_path"]))
+        end
+        local out_path = step["stdout_path"] and M.step_path(ctx, step["stdout_path"])
+        local ok, out = pcall(cmd.exec, line)
+        if not ok then
+            if step["allow_failure"] == true then
+                return
+            end
+            error(out)
+        end
+        if out_path then
+            write_atomic(out_path, tostring(out or ""))
+        end
+    end,
+    warn = function(ctx, step)
+        log.warn("truebrew: " .. ctx.name .. ": " .. M.expand_tokens(ctx, step["message"]))
+    end,
+    set_permissions = function(ctx, step)
+        local line = "chmod" .. (step["non_recursive"] == true and "" or " -R") .. " -- " .. Q(step["permissions"])
+        local any = false
+        for _, p in ipairs(step_paths(ctx, step)) do
+            if exists(p) then
+                line = line .. " " .. Q(p)
+                any = true
+            end
+        end
+        if any then
+            cmd.exec(line)
+        end
+    end,
+    install_gzipped_executable = function(ctx, step)
+        local source = M.step_path(ctx, step["source"])
+        if not exists(source) then
+            return
+        end
+        local target = M.step_path(ctx, step["target"])
+        local tmp = dirname(target) .. "/." .. basename(target) .. ".install-step"
+        mkdir_p(dirname(target))
+        cmd.exec(
+            ("gunzip -c " .. Q(source) .. " > " .. Q(tmp))
+                .. (" && mv -f " .. Q(tmp) .. " " .. Q(target))
+                .. (" && rm -f " .. Q(source) .. " && chmod 755 " .. Q(target))
+        )
+    end,
+    change_dylib_id = function(ctx, step)
+        local source = M.step_path(ctx, step["source"])
+        if step["resolve_source"] == true then
+            source = M.trim(cmd.exec("perl -MCwd -e 'print Cwd::realpath(shift)' " .. Q(source)))
+        end
+        local id = M.expand_tokens(ctx, step["id"])
+        cmd.exec(macho_tool_env() .. "install_name_tool -id " .. Q(id) .. " " .. Q(source))
+        cmd.exec("codesign -f -s - " .. Q(source))
+    end,
+}
+M.POST_INSTALL_STEPS.move_contents = M.POST_INSTALL_STEPS.move_children
+
+-- Like `brew postinstall`: the first failing step aborts the rest with a
+-- warning, but the keg stays installed. Returns true when the steps are done
+-- (unsupported steps are skipped, not retried).
+function M.run_post_install(item, paths)
+    local steps = item.formula["post_install_steps"] or {}
+    if #steps == 0 then
+        return true
+    end
+    local ctx = M.post_install_context(item, paths)
+    for i, step in ipairs(steps) do
+        local kind = tostring(step["type"])
+        if M.step_guards_match(ctx, step) then
+            local fn = M.POST_INSTALL_STEPS[kind]
+            if not fn then
+                log.warn("truebrew: " .. item.name .. ": skipping unsupported post-install step '" .. kind .. "'")
+            else
+                local ok, err = pcall(fn, ctx, step)
+                if not ok then
+                    log.warn(
+                        "truebrew: "
+                            .. item.name
+                            .. ": post-install step "
+                            .. i
+                            .. " ("
+                            .. kind
+                            .. ") failed, skipping the rest: "
+                            .. tostring(err)
+                    )
+                    return false
+                end
+            end
+        end
+    end
+    log.info("truebrew: ran " .. #steps .. " post-install steps for " .. item.name)
+    return true
+end
+
+-- Rerun a previously poured keg's own steps when relinking it.
+function M.relink_post_install(paths, name, keg_dir)
+    local receipt = M.read_keg_receipt(keg_dir)
+    if not receipt then
+        return
+    end
+    M.ensure_post_install({
+        name = name,
+        keg_dir = keg_dir,
+        formula = { versions = { stable = receipt["stable"] }, post_install_steps = receipt["post_install_steps"] },
+    }, paths, true)
+end
+
+-- Dependencies run their steps once per poured keg (the receipt records
+-- completion). The requested formula reruns them on every install/relink,
+-- like `brew reinstall`: steps may write shared, unversioned paths (node's
+-- lib/node_modules/npm) that another version of the formula has replaced.
+function M.ensure_post_install(item, paths, force)
+    local receipt = M.read_keg_receipt(item.keg_dir)
+    if not receipt or (not force and receipt["post_install_version"] == M.POST_INSTALL_VERSION) then
+        return
+    end
+    if M.run_post_install(item, paths) then
+        receipt["post_install_version"] = M.POST_INSTALL_VERSION
+        local ok, encoded = pcall(json.encode, receipt)
+        if ok then
+            write_atomic(M.join(item.keg_dir, ".truebrew.json"), encoded)
+        end
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- mise shim (install_path)
+-- ---------------------------------------------------------------------------
+
+-- opts.terminfo: relocated ncurses database to append to TERMINFO_DIRS.
+-- opts.ca_bundle: default SSL_CERT_FILE. Bottled OpenSSL hardcodes
+-- OPENSSLDIR=/opt/homebrew/etc/openssl@N, which does not exist here.
+function M.write_launcher(dest, src, opts)
     local fh, err = io.open(dest, "w")
     if not fh then
         error("truebrew: cannot write launcher " .. dest .. ": " .. tostring(err))
     end
     fh:write("#!/bin/sh\n")
-    fh:write("# Restore the relocated database even when sudo drops the environment.\n")
-    fh:write("truebrew_terminfo=" .. M.shquote(terminfo) .. "\n")
-    fh:write('if [ -d "$truebrew_terminfo" ]; then\n')
-    fh:write('    case ":${TERMINFO_DIRS-}:" in\n')
-    fh:write('        *":$truebrew_terminfo:"*) ;;\n')
-    fh:write('        *) TERMINFO_DIRS="${TERMINFO_DIRS:+$TERMINFO_DIRS:}$truebrew_terminfo:"; export TERMINFO_DIRS ;;\n')
-    fh:write("    esac\nfi\n")
+    if opts.terminfo then
+        fh:write("# Restore the relocated database even when sudo drops the environment.\n")
+        fh:write("truebrew_terminfo=" .. M.shquote(opts.terminfo) .. "\n")
+        fh:write('if [ -d "$truebrew_terminfo" ]; then\n')
+        fh:write('    case ":${TERMINFO_DIRS-}:" in\n')
+        fh:write('        *":$truebrew_terminfo:"*) ;;\n')
+        fh:write(
+            '        *) TERMINFO_DIRS="${TERMINFO_DIRS:+$TERMINFO_DIRS:}$truebrew_terminfo:"; export TERMINFO_DIRS ;;\n'
+        )
+        fh:write("    esac\nfi\n")
+    end
+    if opts.ca_bundle then
+        fh:write("# Bottled OpenSSL looks for certificates under /opt/homebrew.\n")
+        fh:write("truebrew_ca_bundle=" .. M.shquote(opts.ca_bundle) .. "\n")
+        fh:write('if [ -z "${SSL_CERT_FILE-}" ] && [ -f "$truebrew_ca_bundle" ]; then\n')
+        fh:write('    SSL_CERT_FILE="$truebrew_ca_bundle"; export SSL_CERT_FILE\n')
+        fh:write("fi\n")
+    end
     fh:write("exec " .. M.shquote(src) .. ' "$@"\n')
     fh:close()
     cmd.exec("chmod 755 " .. M.shquote(dest))
@@ -1148,10 +1768,16 @@ end
 
 function M.write_shim(install_path, keg_dir, meta)
     pcall(cmd.exec, "mkdir -p " .. M.shquote(M.join(install_path, "bin")))
-    local terminfo = M.join(meta.prefix, "opt", "ncurses", "share", "terminfo")
-    local needs_terminfo = M.uses_ncurses(keg_dir, meta.prefix)
-    -- Ncurses consumers need a launcher: sudo can bypass BackendExecEnv.
-    -- Other executables keep their direct symlinks.
+    -- Ncurses and OpenSSL consumers need a launcher: sudo or a direct path
+    -- invocation bypasses BackendExecEnv. Other executables keep symlinks.
+    local launcher = {}
+    if M.uses_ncurses(keg_dir, meta.prefix) then
+        launcher.terminfo = M.join(meta.prefix, "opt", "ncurses", "share", "terminfo")
+    end
+    if M.uses_openssl(keg_dir, meta.prefix) then
+        launcher.ca_bundle = M.ca_bundle(meta.prefix)
+    end
+    local needs_launcher = next(launcher) ~= nil
     for _, sub in ipairs({ "bin", "sbin" }) do
         local src_dir = M.join(keg_dir, sub)
         if file.exists(src_dir) then
@@ -1160,8 +1786,8 @@ function M.write_shim(install_path, keg_dir, meta)
                 local dest = M.join(install_path, "bin", base)
                 if M.is_file_like(src) then
                     pcall(cmd.exec, "rm -f " .. M.shquote(dest))
-                    if needs_terminfo then
-                        M.write_terminfo_launcher(dest, src, terminfo)
+                    if needs_launcher then
+                        M.write_launcher(dest, src, launcher)
                     else
                         local ok2, err2 =
                             pcall(cmd.exec, "ln -s " .. M.shquote(src) .. " " .. M.shquote(dest))

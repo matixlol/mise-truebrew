@@ -41,6 +41,14 @@ For `truebrew:<formula>@<version>`, the plugin:
    - touched Mach-O files are re-signed with `codesign -f -s -`.
 6. Links `opt/<name>` → `Cellar/<name>/<version>` and shims the keg's
    `bin`/`sbin` executables into mise's `install_path/bin`.
+7. Runs each keg's `post_install_steps`, Homebrew's declarative post-install
+   served by the same API (e.g. `ca-certificates` builds
+   `etc/ca-certificates/cert.pem`, `node` installs npm). Steps that wrap Ruby
+   logic, need sudo, start services, or rebuild prefix-wide caches (truebrew
+   does not link kegs into the prefix) are skipped with a warning. Bottled
+   OpenSSL hardcodes `/opt/homebrew/etc/openssl@N`, so executables that depend
+   on OpenSSL get a small launcher that sets `SSL_CERT_FILE` to the bundle,
+   unless you already set it.
 
 ## Usage
 

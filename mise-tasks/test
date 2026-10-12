@@ -11,6 +11,9 @@ echo "plugin: $PLUGIN_DIR"
 echo "-- search cache regression --"
 python3 "$PLUGIN_DIR/tests/search_cache.py"
 
+echo "-- post_install_steps runner --"
+lua "$PLUGIN_DIR/tests/post_install_steps.lua"
+
 mise plugin link --force truebrew "$PLUGIN_DIR"
 
 echo "-- ls-remote truebrew:jq --"
@@ -48,5 +51,12 @@ ncurses_install="$(mise where truebrew:ncurses@latest)"
 env -u TERMINFO -u TERMINFO_DIRS "$ncurses_install/bin/infocmp" xterm-256color >/dev/null
 env -u TERMINFO TERMINFO_DIRS=/nonexistent/custom-terminfo \
     "$ncurses_install/bin/infocmp" xterm-256color >/dev/null
+
+echo "-- TLS through bottled OpenSSL, invoked directly (ca-certificates post-install) --"
+mise install truebrew:wget@latest
+wget_install="$(mise where truebrew:wget@latest)"
+# Bottled OpenSSL looks for /opt/homebrew/etc/openssl@N/cert.pem; the launcher
+# must supply truebrew's CA bundle without mise's environment hook.
+env -u SSL_CERT_FILE -u SSL_CERT_DIR "$wget_install/bin/wget" -q -O /dev/null https://formulae.brew.sh/
 
 echo "OK"

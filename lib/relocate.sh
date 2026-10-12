@@ -20,6 +20,20 @@ trap 'rm -rf "$tmp"' EXIT INT TERM
 
 os=$(uname -s)
 
+# The /usr/bin otool/install_name_tool shims go through xcrun, which refuses to
+# run when the selected Xcode's license is unaccepted (or Xcode is half
+# removed). Fall back to the Command Line Tools rather than relocating nothing.
+if [ "$os" = "Darwin" ] && ! otool -h /bin/ls >/dev/null 2>&1; then
+    if [ -x /Library/Developer/CommandLineTools/usr/bin/otool ]; then
+        DEVELOPER_DIR=/Library/Developer/CommandLineTools
+        export DEVELOPER_DIR
+    fi
+    if ! otool -h /bin/ls >/dev/null 2>&1; then
+        echo "truebrew: otool is not usable; run 'xcode-select --install' or accept the Xcode license" >&2
+        exit 1
+    fi
+fi
+
 esc() {
     printf '%s' "$1" | sed 's/[&|\\@$]/\\&/g'
 }
@@ -48,7 +62,8 @@ if [ -s "$tmp/cands" ]; then
                 echo "truebrew: Mach-O file on non-macOS: $f" >&2
                 continue
             fi
-            otool -L "$f" | awk 'NR>1 {print $1}' | grep '@@HOMEBREW' >"$tmp/refs" || true
+            otool -L "$f" >"$tmp/otool" || exit 1
+            awk 'NR>1 {print $1}' "$tmp/otool" | grep '@@HOMEBREW' >"$tmp/refs" || true
             touched=0
             if [ -s "$tmp/refs" ]; then
                 while IFS= read -r old; do
@@ -57,7 +72,8 @@ if [ -s "$tmp/cands" ]; then
                     touched=1
                 done <"$tmp/refs"
             fi
-            id=$(otool -D "$f" | tail -n 1) || exit 1
+            otool -D "$f" >"$tmp/otool" || exit 1
+            id=$(tail -n 1 "$tmp/otool")
             case "$id" in
             *@@HOMEBREW*)
                 install_name_tool -id "$(subst "$id")" "$f" || exit 1

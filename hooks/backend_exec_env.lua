@@ -57,6 +57,19 @@ function PLUGIN:BackendExecEnv(ctx)
         end
     end
 
+    -- Bottled OpenSSL hardcodes OPENSSLDIR=/opt/homebrew/etc/openssl@N; point
+    -- consumers at the relocated bundle unless the user chose their own.
+    local ca_bundle = tb.ca_bundle(paths.prefix)
+    local keg = ctx.tool and ctx.tool ~= "" and tb.join(paths.opt, ctx.tool)
+    if
+        (os.getenv("SSL_CERT_FILE") or "") == ""
+        and file.exists(ca_bundle)
+        and keg
+        and tb.uses_openssl(keg, paths.prefix)
+    then
+        add("SSL_CERT_FILE", ca_bundle)
+    end
+
     -- Linux dynamic loader fallback for any ELF RPATH we could not rewrite.
     if tb.current_os() == "linux" then
         add("LD_LIBRARY_PATH", tb.join(paths.prefix, "lib"))
