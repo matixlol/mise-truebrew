@@ -1034,6 +1034,8 @@ function M.pour_keg(item, paths)
         ruby_source_path = item.formula["ruby_source_path"],
         tap_git_head = item.formula["tap_git_head"],
         runtime_dependencies = M.runtime_deps(item.formula, M.current_os()),
+        -- The API only serves the current version's steps; keep this keg's.
+        post_install_steps = item.formula["post_install_steps"] or {},
     })
     M.refresh_opt_link(paths, name, item.keg_ver)
 end
@@ -1098,8 +1100,8 @@ function M.install_with_deps(name, paths, stack)
         M.pour_keg(item, paths)
     end
     log.info("truebrew: poured " .. #need .. " kegs (" .. (os.time() - t2) .. "s pour)")
-    for _, item in ipairs(order) do
-        M.ensure_post_install(item, paths)
+    for i, item in ipairs(order) do
+        M.ensure_post_install(item, paths, i == #order)
     end
     return order[#order].keg_dir
 end
@@ -1402,17 +1404,9 @@ local function write_atomic(path, content)
     cmd.exec("mv -f " .. Q(tmp) .. " " .. Q(path))
 end
 
-local function run_formula_tool(ctx, formula, executable, args)
-    local tool = M.join(ctx.paths.opt, formula, "bin", executable)
-    if not sh_ok("test -x " .. Q(tool)) then
-        error(formula .. " is missing required executable: " .. tool)
-    end
-    local line = Q(tool)
-    for _, a in ipairs(args) do
-        line = line .. " " .. Q(a)
-    end
-    cmd.exec(line)
-end
+-- Not implemented: glib/gtk/mime/desktop cache rebuilds index
+-- <prefix>/share, which only `brew link` populates; truebrew never links kegs
+-- into the prefix, so running them would record success over an empty index.
 
 -- Same fallback as relocate.sh for an unusable xcrun-backed otool shim.
 local function macho_tool_env()
@@ -1505,7 +1499,8 @@ M.POST_INSTALL_STEPS = {
     end,
     inreplace = function(ctx, step)
         local pattern = step["regexp"] == true and "$tb_before" or "\\Q$tb_before\\E"
-        local flags = step["first_only"] == true and "" or "g"
+        -- Ruby's ^ and $ always match at line boundaries; Perl needs /m.
+        local flags = (step["first_only"] == true and "" or "g") .. (step["regexp"] == true and "m" or "")
         local audit = step["skip_audit"] ~= true and "$tb_n ? 0 : 1" or "0"
         local script = "BEGIN { $tb_before = $ENV{TB_BEFORE}; $tb_after = $ENV{TB_AFTER}; $tb_n = 0 } "
             .. ("$tb_n++ if s/" .. pattern .. "/$tb_after/" .. flags .. "; ")
@@ -1664,29 +1659,6 @@ done]]
         cmd.exec(macho_tool_env() .. "install_name_tool -id " .. Q(id) .. " " .. Q(source))
         cmd.exec("codesign -f -s - " .. Q(source))
     end,
-    compile_gsettings_schemas = function(ctx, step)
-        run_formula_tool(ctx, "glib", "glib-compile-schemas", { M.step_path(ctx, step["path"]) })
-    end,
-    gio_querymodules = function(ctx, step)
-        run_formula_tool(ctx, "glib", "gio-querymodules", { M.step_path(ctx, step["path"]) })
-    end,
-    gdk_pixbuf_query_loaders = function(ctx, _)
-        run_formula_tool(ctx, "gdk-pixbuf", "gdk-pixbuf-query-loaders", { "--update-cache" })
-    end,
-    gtk_update_icon_cache = function(ctx, step)
-        local p = M.step_path(ctx, step["path"])
-        if file.exists(M.join(ctx.paths.opt, "gtk4")) then
-            run_formula_tool(ctx, "gtk4", "gtk4-update-icon-cache", { "-q", "-t", "-f", p })
-        else
-            run_formula_tool(ctx, "gtk+3", "gtk3-update-icon-cache", { "-q", "-t", "-f", p })
-        end
-    end,
-    update_mime_database = function(ctx, step)
-        run_formula_tool(ctx, "shared-mime-info", "update-mime-database", { M.step_path(ctx, step["path"]) })
-    end,
-    update_desktop_database = function(ctx, step)
-        run_formula_tool(ctx, "desktop-file-utils", "update-desktop-database", { M.step_path(ctx, step["path"]) })
-    end,
 }
 M.POST_INSTALL_STEPS.move_contents = M.POST_INSTALL_STEPS.move_children
 
@@ -1727,10 +1699,26 @@ function M.run_post_install(item, paths)
     return true
 end
 
--- Runs once per poured keg; the receipt records completion.
-function M.ensure_post_install(item, paths)
+-- Rerun a previously poured keg's own steps when relinking it.
+function M.relink_post_install(paths, name, keg_dir)
+    local receipt = M.read_keg_receipt(keg_dir)
+    if not receipt then
+        return
+    end
+    M.ensure_post_install({
+        name = name,
+        keg_dir = keg_dir,
+        formula = { versions = { stable = receipt["stable"] }, post_install_steps = receipt["post_install_steps"] },
+    }, paths, true)
+end
+
+-- Dependencies run their steps once per poured keg (the receipt records
+-- completion). The requested formula reruns them on every install/relink,
+-- like `brew reinstall`: steps may write shared, unversioned paths (node's
+-- lib/node_modules/npm) that another version of the formula has replaced.
+function M.ensure_post_install(item, paths, force)
     local receipt = M.read_keg_receipt(item.keg_dir)
-    if not receipt or receipt["post_install_version"] == M.POST_INSTALL_VERSION then
+    if not receipt or (not force and receipt["post_install_version"] == M.POST_INSTALL_VERSION) then
         return
     end
     if M.run_post_install(item, paths) then

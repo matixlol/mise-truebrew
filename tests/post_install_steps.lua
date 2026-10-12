@@ -61,6 +61,7 @@ sh("mkdir -p '" .. keg .. "/libexec/tree/sub' '" .. keg .. "/bin' '" .. keg .. "
 sh("echo hi > '" .. keg .. "/libexec/tree/sub/a.txt' && echo man > '" .. keg .. "/share/demo/x-one.1'")
 sh("echo man > '" .. keg .. "/share/demo/y-two.1' && echo skip > '" .. keg .. "/share/demo/z.1'")
 sh("printf 'path=@OLD@ and @OLD@\\n' > '" .. keg .. "/libexec/conf'")
+sh("printf '# comment\\nuser=nagios\\nother=1\\n' > '" .. keg .. "/libexec/users.cfg'")
 sh("printf '#!/bin/sh\\necho gz-ok\\n' | gzip > '" .. keg .. "/libexec/tool.gz'")
 sh(
     "printf '#!/bin/sh\\necho \"$DEMO_ENV:$1:$(cat)\"\\n' > '"
@@ -92,6 +93,15 @@ local steps = {
         force = true,
     },
     { type = "inreplace", path = P("conf", "libexec"), before = "@OLD@", after = "{{opt_prefix}}" },
+    -- Ruby anchors: ^/$ match per line and `.` stops at newlines.
+    {
+        type = "inreplace",
+        path = P("users.cfg", "libexec"),
+        before = "^user=.*$",
+        after = "user={{user}}",
+        regexp = true,
+        skip_audit = true,
+    },
     { type = "link_dir", source = P("tree", "libexec"), target = P("demo-tree", "homebrew_prefix") },
     {
         type = "link_children",
@@ -153,6 +163,10 @@ check(
 check(not pcall(sh, "test -e '" .. pre .. "/share/man/man1/z.1'"), "glob excludes")
 check(read(keg .. "/libexec/conf") == "path=" .. pre .. "/opt/demo and " .. pre .. "/opt/demo\n", "inreplace global")
 check(
+    read(keg .. "/libexec/users.cfg") == "# comment\nuser=" .. os.getenv("USER") .. "\nother=1\n",
+    "inreplace regexp anchors"
+)
+check(
     read(pre .. "/demo-tree/sub/a.txt") == "hi\n" and pcall(sh, "test -L '" .. pre .. "/demo-tree/sub/a.txt'"),
     "link_dir"
 )
@@ -177,6 +191,19 @@ item.formula.post_install_steps = {
 }
 check(not M.run_post_install(item, paths), "failed audit reports failure")
 check(not pcall(sh, "test -e '" .. pre .. "/var/demo/after-failure'"), "failure stops later steps")
+
+-- Relinking an older keg reruns the steps recorded in its receipt.
+-- (The json stub cannot round-trip, so serve the receipt directly.)
+M.read_keg_receipt = function(dir)
+    check(dir == keg, "relink reads the requested keg's receipt")
+    return {
+        name = "demo",
+        stable = "1.2.3",
+        post_install_steps = { { type = "touch", path = P("demo/relinked-{{version}}", "var") } },
+    }
+end
+M.relink_post_install(paths, "demo", keg)
+check(pcall(sh, "test -e '" .. pre .. "/var/demo/relinked-1.2.3'"), "relink reruns receipt steps")
 
 sh("rm -rf '" .. root .. "'")
 print("post_install_steps: OK")
