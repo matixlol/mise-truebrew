@@ -51,7 +51,6 @@ function PLUGIN:BackendInstall(ctx)
         elseif file.exists(requested_keg) then
             log.info("truebrew: linking previously poured " .. tool .. " " .. version)
             tb.refresh_opt_link(paths, formula["name"] or tool, version)
-            tb.setup_ca_certificates(paths)
             tb.write_shim(install_path, requested_keg, {
                 name = formula["name"] or tool,
                 version = version,
