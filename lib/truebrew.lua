@@ -795,7 +795,7 @@ function M.run_parallel(commands, max_jobs)
 end
 
 -- Bump when relocation semantics change; older kegs are re-poured automatically.
-M.RELOCATE_VERSION = 2
+M.RELOCATE_VERSION = 3
 
 M._prefetch_seq = 0
 
@@ -1098,16 +1098,17 @@ function M.install_with_deps(name, paths, stack)
         M.pour_keg(item, paths)
     end
     log.info("truebrew: poured " .. #need .. " kegs (" .. (os.time() - t2) .. "s pour)")
+    M.setup_ca_certificates(paths)
     return order[#order].keg_dir
 end
 
 -- ---------------------------------------------------------------------------
--- mise shim (install_path)
+-- dependency queries
 -- ---------------------------------------------------------------------------
 
--- Use installed receipts to cover direct and transitive ncurses dependencies,
+-- Use installed receipts to cover direct and transitive dependencies,
 -- including relinks of older kegs, without fetching current formula metadata.
-function M.uses_ncurses(keg_dir, prefix, seen)
+function M.uses_dep(keg_dir, prefix, matches, seen)
     seen = seen or {}
     if seen[keg_dir] then
         return false
@@ -1117,30 +1118,113 @@ function M.uses_ncurses(keg_dir, prefix, seen)
     if not receipt then
         return false
     end
-    if receipt.name == "ncurses" then
+    if matches(receipt.name) then
         return true
     end
     for _, dep in ipairs(receipt.runtime_dependencies or {}) do
-        if dep == "ncurses" or M.uses_ncurses(M.join(prefix, "opt", dep), prefix, seen) then
+        if matches(dep) or M.uses_dep(M.join(prefix, "opt", dep), prefix, matches, seen) then
             return true
         end
     end
     return false
 end
 
-function M.write_terminfo_launcher(dest, src, terminfo)
+function M.is_openssl(name)
+    return name == "openssl" or tostring(name):match("^openssl@") ~= nil
+end
+
+function M.uses_ncurses(keg_dir, prefix)
+    return M.uses_dep(keg_dir, prefix, function(name)
+        return name == "ncurses"
+    end)
+end
+
+function M.uses_openssl(keg_dir, prefix)
+    return M.uses_dep(keg_dir, prefix, M.is_openssl)
+end
+
+-- ---------------------------------------------------------------------------
+-- CA certificates (what Homebrew's post_install would do)
+-- ---------------------------------------------------------------------------
+
+function M.ca_bundle(prefix)
+    return M.join(prefix, "etc", "ca-certificates", "cert.pem")
+end
+
+-- Bottles never ship etc/: Homebrew's ca-certificates post_install writes
+-- etc/ca-certificates/cert.pem (certifi's cacert.pem symlinks to it) and
+-- openssl's links etc/openssl@N/cert.pem to it. Without them TLS clients
+-- have no trust store at all. Idempotent; runs on every install.
+function M.setup_ca_certificates(paths)
+    local src = M.join(paths.opt, "ca-certificates", "share", "ca-certificates", "cacert.pem")
+    if not file.exists(src) then
+        return
+    end
+    local etc = M.join(paths.prefix, "etc")
+    local bundle = M.ca_bundle(paths.prefix)
+    local tmp = bundle .. ".tmp"
+    local ok, err = pcall(
+        cmd.exec,
+        "mkdir -p "
+            .. M.shquote(M.join(etc, "ca-certificates"))
+            .. " && cp "
+            .. M.shquote(src)
+            .. " "
+            .. M.shquote(tmp)
+            .. " && mv -f "
+            .. M.shquote(tmp)
+            .. " "
+            .. M.shquote(bundle)
+    )
+    if not ok then
+        error("truebrew: cannot install CA bundle " .. bundle .. ": " .. tostring(err))
+    end
+    for _, name in ipairs(M.dir_entries(paths.opt)) do
+        if M.is_openssl(name) then
+            local dir = M.join(etc, name)
+            local link = M.join(dir, "cert.pem")
+            ok, err = pcall(
+                cmd.exec,
+                "mkdir -p " .. M.shquote(dir) .. " && ln -sfn ../ca-certificates/cert.pem " .. M.shquote(link)
+            )
+            if not ok then
+                error("truebrew: cannot link " .. link .. ": " .. tostring(err))
+            end
+        end
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- mise shim (install_path)
+-- ---------------------------------------------------------------------------
+
+-- opts.terminfo: relocated ncurses database to append to TERMINFO_DIRS.
+-- opts.ca_bundle: default SSL_CERT_FILE. Bottled OpenSSL hardcodes
+-- OPENSSLDIR=/opt/homebrew/etc/openssl@N, which does not exist here.
+function M.write_launcher(dest, src, opts)
     local fh, err = io.open(dest, "w")
     if not fh then
         error("truebrew: cannot write launcher " .. dest .. ": " .. tostring(err))
     end
     fh:write("#!/bin/sh\n")
-    fh:write("# Restore the relocated database even when sudo drops the environment.\n")
-    fh:write("truebrew_terminfo=" .. M.shquote(terminfo) .. "\n")
-    fh:write('if [ -d "$truebrew_terminfo" ]; then\n')
-    fh:write('    case ":${TERMINFO_DIRS-}:" in\n')
-    fh:write('        *":$truebrew_terminfo:"*) ;;\n')
-    fh:write('        *) TERMINFO_DIRS="${TERMINFO_DIRS:+$TERMINFO_DIRS:}$truebrew_terminfo:"; export TERMINFO_DIRS ;;\n')
-    fh:write("    esac\nfi\n")
+    if opts.terminfo then
+        fh:write("# Restore the relocated database even when sudo drops the environment.\n")
+        fh:write("truebrew_terminfo=" .. M.shquote(opts.terminfo) .. "\n")
+        fh:write('if [ -d "$truebrew_terminfo" ]; then\n')
+        fh:write('    case ":${TERMINFO_DIRS-}:" in\n')
+        fh:write('        *":$truebrew_terminfo:"*) ;;\n')
+        fh:write(
+            '        *) TERMINFO_DIRS="${TERMINFO_DIRS:+$TERMINFO_DIRS:}$truebrew_terminfo:"; export TERMINFO_DIRS ;;\n'
+        )
+        fh:write("    esac\nfi\n")
+    end
+    if opts.ca_bundle then
+        fh:write("# Bottled OpenSSL looks for certificates under /opt/homebrew.\n")
+        fh:write("truebrew_ca_bundle=" .. M.shquote(opts.ca_bundle) .. "\n")
+        fh:write('if [ -z "${SSL_CERT_FILE-}" ] && [ -f "$truebrew_ca_bundle" ]; then\n')
+        fh:write('    SSL_CERT_FILE="$truebrew_ca_bundle"; export SSL_CERT_FILE\n')
+        fh:write("fi\n")
+    end
     fh:write("exec " .. M.shquote(src) .. ' "$@"\n')
     fh:close()
     cmd.exec("chmod 755 " .. M.shquote(dest))
@@ -1148,10 +1232,16 @@ end
 
 function M.write_shim(install_path, keg_dir, meta)
     pcall(cmd.exec, "mkdir -p " .. M.shquote(M.join(install_path, "bin")))
-    local terminfo = M.join(meta.prefix, "opt", "ncurses", "share", "terminfo")
-    local needs_terminfo = M.uses_ncurses(keg_dir, meta.prefix)
-    -- Ncurses consumers need a launcher: sudo can bypass BackendExecEnv.
-    -- Other executables keep their direct symlinks.
+    -- Ncurses and OpenSSL consumers need a launcher: sudo or a direct path
+    -- invocation bypasses BackendExecEnv. Other executables keep symlinks.
+    local launcher = {}
+    if M.uses_ncurses(keg_dir, meta.prefix) then
+        launcher.terminfo = M.join(meta.prefix, "opt", "ncurses", "share", "terminfo")
+    end
+    if M.uses_openssl(keg_dir, meta.prefix) then
+        launcher.ca_bundle = M.ca_bundle(meta.prefix)
+    end
+    local needs_launcher = next(launcher) ~= nil
     for _, sub in ipairs({ "bin", "sbin" }) do
         local src_dir = M.join(keg_dir, sub)
         if file.exists(src_dir) then
@@ -1160,8 +1250,8 @@ function M.write_shim(install_path, keg_dir, meta)
                 local dest = M.join(install_path, "bin", base)
                 if M.is_file_like(src) then
                     pcall(cmd.exec, "rm -f " .. M.shquote(dest))
-                    if needs_terminfo then
-                        M.write_terminfo_launcher(dest, src, terminfo)
+                    if needs_launcher then
+                        M.write_launcher(dest, src, launcher)
                     else
                         local ok2, err2 =
                             pcall(cmd.exec, "ln -s " .. M.shquote(src) .. " " .. M.shquote(dest))

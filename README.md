@@ -41,6 +41,12 @@ For `truebrew:<formula>@<version>`, the plugin:
    - touched Mach-O files are re-signed with `codesign -f -s -`.
 6. Links `opt/<name>` → `Cellar/<name>/<version>` and shims the keg's
    `bin`/`sbin` executables into mise's `install_path/bin`.
+7. Runs the parts of `post_install` that bottles rely on: writes
+   `etc/ca-certificates/cert.pem` (certifi links to it) and links
+   `etc/openssl@N/cert.pem` to it. Bottled OpenSSL hardcodes
+   `/opt/homebrew/etc/openssl@N`, so executables that depend on OpenSSL get a
+   small launcher that sets `SSL_CERT_FILE` to the bundle, unless you already
+   set it.
 
 ## Usage
 
